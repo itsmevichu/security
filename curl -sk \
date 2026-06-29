@@ -1,0 +1,34 @@
+curl -sk \
+  --cert /usr/share/opensearch/config/kirk.pem \
+  --key /usr/share/opensearch/config/kirk-key.pem \
+  -X PUT \
+  https://localhost:9200/_plugins/_security/api/roles/test_role \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cluster_permissions": [
+      "restapi:admin/actiongroups",
+      "restapi:admin/roles",
+      "restapi:admin/rolesmapping"
+    ]
+  }'
+
+
+
+
+  curl -sk \
+  -u admin:MyPassword@123 \
+  -X PUT \
+  https://localhost:9200/_plugins/_security/api/roles/test_role \
+  -H "Content-Type: application/json" \
+  -d '{
+    "cluster_permissions": [
+      "restapi:admin/actiongroups",
+      "restapi:admin/roles",
+      "restapi:admin/rolesmapping"
+    ]
+  }'
+
+
+"
+Fixes role creation with 'restapi:admin/*' permissions via the REST API
+"
