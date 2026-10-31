@@ -21,97 +21,84 @@ jobs:
     with:
       product: opensearch
 
+  # Builds the plugin the way the distribution build does: scripts/build.sh in the CI image, with the image's JDK.
+  # The test jobs run on the runner image, so this is the only job that pulls the CI image.
+  build-ci-image:
+    name: build (ci image)
+    needs: ["Get-CI-Image-Tag"]
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-version-linux }}
+      # need to switch to root so that github actions can install runner binary on container without permission issues.
+      options: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-options }}
+    env:
+      # Same JDK as the ci image args in the opensearch-build manifest.
+      JAVA_HOME: /opt/java/openjdk-25
+
+    steps:
+      - name: Run start commands
+        run: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-command }}
+
+      - name: Checkout security
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Build with scripts/build.sh
+        run: |
+          opensearch_version=$(grep -oP '"opensearch.version", "\K[0-9.]+' build.gradle)
+          "$JAVA_HOME/bin/java" -version
+          ./scripts/build.sh -v "$opensearch_version" -s true
+          test -s "artifacts/plugins/opensearch-security-${opensearch_version}.0-SNAPSHOT.zip"
+
   generate-test-list:
     runs-on: ubuntu-latest
     outputs:
       separateTestsNames: ${{ steps.set-matrix.outputs.separateTestsNames }}
     steps:
       - name: Set up JDK for build and test
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin # Temurin is a distribution of adoptium
           java-version: 21
 
       - name: Checkout security
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - name: Generate list of tasks
         id: set-matrix
         run: |
           echo "separateTestsNames=$(./gradlew listTasksAsJSON -q --console=plain | tail -n 1)" >> $GITHUB_OUTPUT
 
-  test-windows:
+  test:
     name: test
     needs: [generate-test-list]
     strategy:
       fail-fast: false
       matrix:
         gradle_task: ${{ fromJson(needs.generate-test-list.outputs.separateTestsNames) }}
-        platform: [windows-latest]
+        platform: [ubuntu-latest, windows-latest]
         jdk: [21, 25]
     runs-on: ${{ matrix.platform }}
 
     steps:
       - name: Set up JDK for build and test
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin # Temurin is a distribution of adoptium
           java-version: ${{ matrix.jdk }}
 
       - name: Checkout security
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
-      - name: Build and Test
-        uses: gradle/actions/setup-gradle@d9c87d481d55275bb5441eef3fe0e46805f9ef70 # v3.5.0
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
         with:
           cache-disabled: true
-          arguments: |
-            ${{ matrix.gradle_task }} -Dbuild.snapshot=false
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        if: always()
-        with:
-          name: ${{ matrix.platform }}-JDK${{ matrix.jdk }}-${{ matrix.gradle_task }}-reports
-          path: |
-            ./build/reports/
-
-  test-linux:
-    name: test
-    needs: ["generate-test-list", "Get-CI-Image-Tag"]
-    strategy:
-      fail-fast: false
-      matrix:
-        gradle_task: ${{ fromJson(needs.generate-test-list.outputs.separateTestsNames) }}
-        platform: [ubuntu-latest]
-        jdk: [21, 25]
-    runs-on: ubuntu-latest
-    container:
-      # using the same image which is used by opensearch-build to build the OpenSearch Distribution
-      # this image tag is subject to change as more dependencies and updates will arrive over time
-      image: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-version-linux }}
-      # need to switch to root so that github actions can install runner binary on container without permission issues.
-      options: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-options }}
-
-    steps:
-      - name: Run start commands
-        run: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-command }}
-      - name: Set up JDK for build and test
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
-        with:
-          distribution: temurin # Temurin is a distribution of adoptium
-          java-version: ${{ matrix.jdk }}
-
-      - name: Checkout security
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Build and Test
-        uses: gradle/actions/setup-gradle@d9c87d481d55275bb5441eef3fe0e46805f9ef70 # v3.5.0
-        with:
-          cache-disabled: true
-          arguments: |
-            ${{ matrix.gradle_task }} -Dbuild.snapshot=false
+        run: ./gradlew ${{ matrix.gradle_task }} -Dbuild.snapshot=false
+        shell: bash
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: ${{ matrix.platform }}-JDK${{ matrix.jdk }}-${{ matrix.gradle_task }}-reports
@@ -119,11 +106,14 @@ jobs:
             ./build/reports/
 
   report-coverage:
-    needs: ["test-windows", "test-linux", "integration-tests-windows", "integration-tests-linux", "sample-plugin-integration-tests-linux", "sample-plugin-integration-tests-windows"]
+    needs: ["test", "integration-tests", "sample-plugin-integration-tests"]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: downloaded-artifacts
 
@@ -132,156 +122,74 @@ jobs:
         working-directory: downloaded-artifacts
 
       - name: Upload Coverage
-        uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
+          use_oidc: true
           fail_ci_if_error: true
           verbose: true
 
-  integration-tests-windows:
+  integration-tests:
     name: integration-tests
     strategy:
       fail-fast: false
       matrix:
         jdk: [21, 25]
-        platform: [windows-latest]
+        platform: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.platform }}
 
     steps:
       - name: Set up JDK for build and test
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin # Temurin is a distribution of adoptium
           java-version: ${{ matrix.jdk }}
 
       - name: Checkout security
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+        with:
+          cache-disabled: true
 
       - name: Run Integration Tests
-        uses: gradle/actions/setup-gradle@d9c87d481d55275bb5441eef3fe0e46805f9ef70 # v3.5.0
-        with:
-          cache-disabled: true
-          arguments: |
-            :integrationTest -Dbuild.snapshot=false
+        run: ./gradlew :integrationTest -Dbuild.snapshot=false
+        shell: bash
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: integration-${{ matrix.platform }}-JDK${{ matrix.jdk }}-reports
           path: |
             ./build/reports/
 
-  integration-tests-linux:
-    name: integration-tests
-    needs: ["Get-CI-Image-Tag"]
-    strategy:
-      fail-fast: false
-      matrix:
-        jdk: [21, 25]
-        platform: [ubuntu-latest]
-    runs-on: ubuntu-latest
-    container:
-      # using the same image which is used by opensearch-build team to build the OpenSearch Distribution
-      # this image tag is subject to change as more dependencies and updates will arrive over time
-      image: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-version-linux }}
-      # need to switch to root so that github actions can install runner binary on container without permission issues.
-      options: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-options }}
-
-    steps:
-      - name: Run start commands
-        run: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-command }}
-
-      - name: Set up JDK for build and test
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
-        with:
-          distribution: temurin # Temurin is a distribution of adoptium
-          java-version: ${{ matrix.jdk }}
-
-      - name: Checkout security
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Build and Test
-        uses: gradle/actions/setup-gradle@d9c87d481d55275bb5441eef3fe0e46805f9ef70 # v3.5.0
-        with:
-          cache-disabled: true
-          arguments: |
-            :integrationTest -Dbuild.snapshot=false
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        if: always()
-        with:
-          name: integration-${{ matrix.platform }}-JDK${{ matrix.jdk }}-reports
-          path: |
-            ./build/reports/
-
-  sample-plugin-integration-tests-linux:
-    name: sample-plugin-integration-tests
-    needs: [ "Get-CI-Image-Tag" ]
-    strategy:
-      fail-fast: false
-      matrix:
-        jdk: [21, 25]
-        platform: [ubuntu-latest]
-    runs-on: ${{ matrix.platform }}
-    container:
-      # using the same image which is used by opensearch-build team to build the OpenSearch Distribution
-      # this image tag is subject to change as more dependencies and updates will arrive over time
-      image: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-version-linux }}
-      # need to switch to root so that github actions can install runner binary on container without permission issues.
-      options: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-options }}
-
-    steps:
-      - name: Run start commands
-        run: ${{ needs.Get-CI-Image-Tag.outputs.ci-image-start-command }}
-
-      - name: Set up JDK for build and test
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
-        with:
-          distribution: temurin # Temurin is a distribution of adoptium
-          java-version: ${{ matrix.jdk }}
-
-      - name: Checkout security
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Run SampleResourcePlugin Integration Tests
-        uses: gradle/actions/setup-gradle@d9c87d481d55275bb5441eef3fe0e46805f9ef70 # v3.5.0
-        with:
-          arguments: |
-            :opensearch-sample-resource-plugin:integrationTest -Dbuild.snapshot=false
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        if: always()
-        with:
-          name: sample-plugin-integration-${{ matrix.platform }}-JDK${{ matrix.jdk }}-reports
-          path: |
-            ./sample-resource-plugin/build/reports/
-
-  sample-plugin-integration-tests-windows:
+  sample-plugin-integration-tests:
     name: sample-plugin-integration-tests
     strategy:
       fail-fast: false
       matrix:
         jdk: [21, 25]
-        platform: [windows-latest]
+        platform: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.platform }}
 
     steps:
       - name: Set up JDK for build and test
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin # Temurin is a distribution of adoptium
           java-version: ${{ matrix.jdk }}
 
       - name: Checkout security
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
 
       - name: Run SampleResourcePlugin Integration Tests
-        uses: gradle/actions/setup-gradle@d9c87d481d55275bb5441eef3fe0e46805f9ef70 # v3.5.0
-        with:
-          arguments: |
-            :opensearch-sample-resource-plugin:integrationTest -Dbuild.snapshot=false
+        run: ./gradlew :opensearch-sample-resource-plugin:integrationTest -Dbuild.snapshot=false
+        shell: bash
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: sample-plugin-integration-${{ matrix.platform }}-JDK${{ matrix.jdk }}-reports
@@ -300,38 +208,40 @@ jobs:
 
     steps:
       - name: Set up JDK for build and test
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin # Temurin is a distribution of adoptium
           java-version: ${{ matrix.jdk }}
 
       - name: Checkout security
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
-      - name: Run Resource Tests
-        uses: gradle/actions/setup-gradle@d9c87d481d55275bb5441eef3fe0e46805f9ef70 # v3.5.0
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
         with:
           cache-disabled: true
-          arguments: |
-            :integrationTest -Dbuild.snapshot=false --tests org.opensearch.security.ResourceFocusedTests
+
+      - name: Run Resource Tests
+        run: ./gradlew :integrationTest -Dbuild.snapshot=false --tests org.opensearch.security.ResourceFocusedTests
 
   backward-compatibility-build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin # Temurin is a distribution of adoptium
           java-version: 21
 
       - name: Checkout Security Repo
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
-      - name: Build BWC tests
-        uses: gradle/actions/setup-gradle@d9c87d481d55275bb5441eef3fe0e46805f9ef70 # v3.5.0
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
         with:
           cache-disabled: true
-          arguments: |
-            -p bwc-test build -x test -x integTest
+
+      - name: Build BWC tests
+        run: ./gradlew -p bwc-test build -x test -x integTest
 
   backward-compatibility:
     strategy:
@@ -342,13 +252,13 @@ jobs:
     runs-on: ${{ matrix.platform }}
 
     steps:
-      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin # Temurin is a distribution of adoptium
           java-version: ${{ matrix.jdk }}
 
       - name: Checkout Security Repo
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - id: build-previous
         uses: ./.github/actions/run-bwc-suite
@@ -366,28 +276,28 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin # Temurin is a distribution of adoptium
           java-version: 21
-      - uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
         with:
           languages: java
       - run: ./gradlew clean assemble
-      - uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4
 
   build-health:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin # Temurin is a distribution of adoptium
           java-version: 21
       - run: ./gradlew clean buildHealth -Dorg.gradle.jvmargs="-Xms1g -Xmx4g -XX:+UseG1GC -XX:MaxMetaspaceSize=512m"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         if: always()
         with:
           name: dependency-analysis
@@ -398,10 +308,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Environment
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
       - name: Configure Java
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
           java-version: 21

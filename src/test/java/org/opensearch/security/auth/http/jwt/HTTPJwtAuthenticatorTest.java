@@ -35,6 +35,7 @@ import org.junit.Test;
 
 import org.opensearch.OpenSearchSecurityException;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.security.auth.AuthenticationFailureReason;
 import org.opensearch.security.user.AuthCredentials;
 import org.opensearch.security.util.FakeRestRequest;
 
@@ -496,6 +497,64 @@ public class HTTPJwtAuthenticatorTest {
         Assert.assertNotNull(credentials);
         assertThat(credentials.getUsername(), is("Dr. Who"));
         assertThat(credentials.getBackendRoles().size(), is(0));
+    }
+
+    @Test
+    public void testPluginSubjectIsRejected() throws Exception {
+        final AuthCredentials credentials = extractCredentialsFromJwtHeader(
+            Settings.builder().put("signing_key", Base64.getEncoder().encodeToString(secretKeyBytes)),
+            Jwts.builder().setSubject("plugin:org.opensearch.example.Plugin")
+        );
+
+        Assert.assertNotNull(credentials);
+        Assert.assertTrue(credentials.isRejected());
+        Assert.assertFalse(credentials.isComplete());
+        assertThat(credentials.getAttemptedPrincipal(), is("plugin:org.opensearch.example.Plugin"));
+        assertThat(credentials.getFailureReason(), is(AuthenticationFailureReason.RESERVED_SUBJECT_PREFIX));
+    }
+
+    @Test
+    public void testApiTokenSubjectIsRejected() throws Exception {
+        final AuthCredentials credentials = extractCredentialsFromJwtHeader(
+            Settings.builder().put("signing_key", Base64.getEncoder().encodeToString(secretKeyBytes)),
+            Jwts.builder().setSubject("token:administrative-token")
+        );
+
+        Assert.assertNotNull(credentials);
+        Assert.assertTrue(credentials.isRejected());
+        Assert.assertFalse(credentials.isComplete());
+        assertThat(credentials.getAttemptedPrincipal(), is("token:administrative-token"));
+        assertThat(credentials.getFailureReason(), is(AuthenticationFailureReason.RESERVED_SUBJECT_PREFIX));
+    }
+
+    @Test
+    public void testReservedAlternativeSubjectIsRejected() throws Exception {
+        final AuthCredentials credentials = extractCredentialsFromJwtHeader(
+            Settings.builder().put("signing_key", Base64.getEncoder().encodeToString(secretKeyBytes)).put("subject_key", "asub"),
+            Jwts.builder().setSubject("Leonard McCoy").claim("asub", "plugin:org.opensearch.example.Plugin")
+        );
+
+        Assert.assertNotNull(credentials);
+        Assert.assertTrue(credentials.isRejected());
+        Assert.assertFalse(credentials.isComplete());
+        assertThat(credentials.getAttemptedPrincipal(), is("plugin:org.opensearch.example.Plugin"));
+        assertThat(credentials.getFailureReason(), is(AuthenticationFailureReason.RESERVED_SUBJECT_PREFIX));
+    }
+
+    @Test
+    public void testForbiddenSubjectIsRejected() throws Exception {
+        final AuthCredentials credentials = extractCredentialsFromJwtHeader(
+            Settings.builder()
+                .put("signing_key", Base64.getEncoder().encodeToString(secretKeyBytes))
+                .putList("forbidden_subjects", "admin"),
+            Jwts.builder().setSubject("admin")
+        );
+
+        Assert.assertNotNull(credentials);
+        Assert.assertTrue(credentials.isRejected());
+        Assert.assertFalse(credentials.isComplete());
+        assertThat(credentials.getAttemptedPrincipal(), is("admin"));
+        assertThat(credentials.getFailureReason(), is(AuthenticationFailureReason.FORBIDDEN_SUBJECT));
     }
 
     @Test

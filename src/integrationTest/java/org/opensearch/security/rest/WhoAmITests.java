@@ -42,6 +42,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.lessThan;
+import static org.hamcrest.Matchers.notNullValue;
 import static org.opensearch.rest.RestRequest.Method.GET;
 import static org.opensearch.security.auditlog.impl.AuditCategory.GRANTED_PRIVILEGES;
 import static org.opensearch.security.auditlog.impl.AuditCategory.MISSING_PRIVILEGES;
@@ -49,6 +50,7 @@ import static org.opensearch.test.framework.TestSecurityConfig.AuthcDomain.AUTHC
 import static org.opensearch.test.framework.audit.AuditMessagePredicate.grantedPrivilege;
 import static org.opensearch.test.framework.audit.AuditMessagePredicate.privilegePredicateRESTLayer;
 import static org.opensearch.test.framework.audit.AuditMessagePredicate.userAuthenticatedPredicate;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 public class WhoAmITests {
@@ -122,7 +124,7 @@ public class WhoAmITests {
     @Test
     public void testWhoAmIWithoutGetPermissions() {
         try (TestRestClient client = cluster.getRestClient(WHO_AM_I_NO_PERM)) {
-            assertResponse(client.get(WHOAMI_PROTECTED_ENDPOINT), HttpStatus.SC_UNAUTHORIZED, expectedUnuauthorizedBody);
+            assertResponse(client.get(WHOAMI_PROTECTED_ENDPOINT), HttpStatus.SC_FORBIDDEN, expectedUnuauthorizedBody);
             // audit log, named route
             auditLogsRule.assertExactlyOne(userAuthenticatedPredicate(WHO_AM_I_NO_PERM, GET, "/" + WHOAMI_PROTECTED_ENDPOINT));
             auditLogsRule.assertExactlyOne(
@@ -136,7 +138,7 @@ public class WhoAmITests {
     @Test
     public void testWhoAmIWithoutGetPermissionsWithoutLeadingSlashInPath() {
         try (TestRestClient client = cluster.getRestClient(WHO_AM_I_NO_PERM)) {
-            assertThat(client.getWithoutLeadingSlash(WHOAMI_PROTECTED_ENDPOINT).getStatusCode(), equalTo(HttpStatus.SC_UNAUTHORIZED));
+            assertThat(client.getWithoutLeadingSlash(WHOAMI_PROTECTED_ENDPOINT).getStatusCode(), equalTo(HttpStatus.SC_FORBIDDEN));
         }
     }
 
@@ -202,6 +204,8 @@ public class WhoAmITests {
                 transportSet.add(auditMessage);
             }
         }
+        assertFalse(restSet.isEmpty());
+        assertFalse(transportSet.isEmpty());
         // We pass 1 message from each layer to check for similarity
         checkForStructuralSimilarity(restSet.get(0), transportSet.get(0));
     }
@@ -322,6 +326,12 @@ public class WhoAmITests {
             } else if (key.equals("audit_request_layer")) {
                 assertThat(restMsgFields.get(key).toString(), equalTo("REST"));
                 assertThat(transportMsgFields.get(key).toString(), equalTo("TRANSPORT"));
+            } else if (key.equals(AuditMessage.REQUEST_ID)) {
+                // Two distinct requests are paired here for structural comparison
+                // (whoamiprotected vs _cat/indices), so each generates its own
+                // base64UUID — assert presence, not cross-request equality.
+                assertThat(restMsgFields.get(key), notNullValue());
+                assertThat(transportMsgFields.get(key), notNullValue());
             } else {
                 assertThat(restMsgFields.get(key), equalTo(transportMsgFields.get(key)));
             }

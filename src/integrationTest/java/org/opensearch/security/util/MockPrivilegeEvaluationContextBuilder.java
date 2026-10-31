@@ -14,6 +14,7 @@ package org.opensearch.security.util;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
@@ -45,12 +46,18 @@ public class MockPrivilegeEvaluationContextBuilder {
         .build();
 
     private String username = "test_user";
+    private String requestedTenant;
     private Map<String, String> attributes = new HashMap<>();
     private Set<String> roles = new HashSet<>();
     private ClusterState clusterState = EMPTY_CLUSTER_STATE;
     private ActionPrivileges actionPrivileges = ActionPrivileges.EMPTY;
     private String action;
     private ActionRequest request;
+
+    public MockPrivilegeEvaluationContextBuilder requestedTenant(String requestedTenant) {
+        this.requestedTenant = requestedTenant;
+        return this;
+    }
 
     public MockPrivilegeEvaluationContextBuilder attr(String key, String value) {
         this.attributes.put(key, value);
@@ -90,6 +97,9 @@ public class MockPrivilegeEvaluationContextBuilder {
         IndexNameExpressionResolver indexNameExpressionResolver = new IndexNameExpressionResolver(new ThreadContext(Settings.EMPTY));
 
         User user = new User(this.username).withAttributes(ImmutableMap.copyOf(this.attributes));
+        if (this.requestedTenant != null) {
+            user = user.withRequestedTenant(this.requestedTenant);
+        }
         return new PrivilegesEvaluationContext(
             user,
             ImmutableSet.copyOf(roles),
@@ -100,7 +110,8 @@ public class MockPrivilegeEvaluationContextBuilder {
             indexNameExpressionResolver,
             new IndicesRequestResolver(indexNameExpressionResolver),
             () -> clusterState,
-            this.actionPrivileges
+            this.actionPrivileges,
+            List.of()
         );
     }
 }

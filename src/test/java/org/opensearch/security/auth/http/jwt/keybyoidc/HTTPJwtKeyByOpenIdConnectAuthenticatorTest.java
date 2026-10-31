@@ -21,6 +21,7 @@ import org.junit.Test;
 
 import org.opensearch.OpenSearchSecurityException;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.security.auth.AuthenticationFailureReason;
 import org.opensearch.security.user.AuthCredentials;
 import org.opensearch.security.util.FakeRestRequest;
 
@@ -65,6 +66,24 @@ public class HTTPJwtKeyByOpenIdConnectAuthenticatorTest {
         assertThat(creds.getAttributes().get("attr.jwt.aud"), is("[\"" + TestJwts.TEST_AUDIENCE + "\"]"));
         assertThat(creds.getBackendRoles().size(), is(0));
         assertThat(creds.getAttributes().size(), is(4));
+    }
+
+    @Test
+    public void reservedSubjectIsRejected() {
+        Settings settings = Settings.builder().put("openid_connect_url", mockIdpServer.getDiscoverUri()).build();
+        String token = TestJwts.createSigned(TestJwts.create("plugin:org.opensearch.example.Plugin", null, null), TestJwk.OCT_1);
+        HTTPJwtKeyByOpenIdConnectAuthenticator jwtAuth = new HTTPJwtKeyByOpenIdConnectAuthenticator(settings, null);
+
+        AuthCredentials creds = jwtAuth.extractCredentials(
+            new FakeRestRequest(ImmutableMap.of("Authorization", token), new HashMap<>()).asSecurityRequest(),
+            null
+        );
+
+        Assert.assertNotNull(creds);
+        Assert.assertTrue(creds.isRejected());
+        Assert.assertFalse(creds.isComplete());
+        assertThat(creds.getAttemptedPrincipal(), is("plugin:org.opensearch.example.Plugin"));
+        assertThat(creds.getFailureReason(), is(AuthenticationFailureReason.RESERVED_SUBJECT_PREFIX));
     }
 
     @Test

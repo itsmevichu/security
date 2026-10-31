@@ -59,7 +59,7 @@ public class InternalUsersApiAction extends AbstractApiAction {
 
     @Override
     protected void consumeParameters(final RestRequest request) {
-        request.param("name");
+        super.consumeParameters(request);
         request.param("filterBy");
     }
 
@@ -136,6 +136,11 @@ public class InternalUsersApiAction extends AbstractApiAction {
         return CType.INTERNALUSERS;
     }
 
+    @Override
+    protected boolean supportsAsync() {
+        return true;
+    }
+
     private void internalUsersApiRequestHandlers(RequestHandler.RequestHandlersBuilder requestHandlersBuilder) {
         requestHandlersBuilder.onGetRequest(
             request -> ValidationResult.success(request).map(this::processGetRequest).map(securityConfiguration -> {
@@ -167,8 +172,14 @@ public class InternalUsersApiAction extends AbstractApiAction {
                     .map(securityConfiguration -> createOrUpdateAccount(request, securityConfiguration))
                     .map(this::validateAndUpdatePassword)
                     .map(this::addEntityToConfig)
-            );
+            )
+            .withPaginatedGetRequest(this::routeGetRequest);
 
+    }
+
+    @Override
+    protected void postLoadForPagination(final RestRequest request, final SecurityDynamicConfiguration<?> configuration) {
+        userService.includeAccountsIfType(configuration, filterParam(request));
     }
 
     protected final ValidationResult<SecurityConfiguration> filterUsers(SecurityDynamicConfiguration<?> users, UserFilterType userType) {

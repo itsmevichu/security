@@ -56,7 +56,6 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.core.rest.RestStatus;
-import org.opensearch.identity.UserSubject;
 import org.opensearch.security.auditlog.AuditLog;
 import org.opensearch.security.auth.blocking.ClientBlockRegistry;
 import org.opensearch.security.auth.internal.NoOpAuthenticationBackend;
@@ -87,7 +86,7 @@ import static org.opensearch.security.http.HTTPBasicAuthenticator.BASIC_TYPE;
 public class BackendRegistry {
 
     protected static final Logger log = LogManager.getLogger(BackendRegistry.class);
-    private static final Set<String> GRPC_SUPPORTED_AUTH = Set.of("jwt", "basic");
+    private static final Set<String> GRPC_SUPPORTED_AUTH = Set.of("jwt", "basic", "proxy");
 
     private SortedSet<AuthDomain> restAuthDomains;
     private Set<AuthorizationBackend> restAuthorizers;
@@ -249,7 +248,7 @@ public class BackendRegistry {
     public boolean authenticate(final SecurityRequestChannel request) {
         /*
         Over gRPC, we do not support the full set of authentication features.
-        - Auth domain support is limited to JWT only.
+        - Auth domain support is limited to JWT, Basic and Proxy only.
         - Authenticating as superuser is blocked over gRPC.
         - Tenant headers are unsupported.
         - Anonymous auth is unsupported.
@@ -272,8 +271,7 @@ public class BackendRegistry {
         if (adminDns.isAdminDN(sslPrincipal)) {
             // PKI authenticated REST call
             User superuser = new User(sslPrincipal);
-            UserSubject subject = new UserSubjectImpl(threadPool, superuser);
-            threadContext.putPersistent(ConfigConstants.OPENDISTRO_SECURITY_AUTHENTICATED_USER, subject);
+            threadContext.putPersistent(ConfigConstants.OPENDISTRO_SECURITY_AUTHENTICATED_USER, superuser);
             threadContext.putTransient(ConfigConstants.OPENDISTRO_SECURITY_USER, superuser);
             return true;
         }
@@ -350,6 +348,30 @@ public class BackendRegistry {
             }
 
             /*
+            The authenticator found a credential but refused it before authentication, for example a JWT subject with a
+            reserved prefix. An explicit rejection fails the request: later auth domains and anonymous login are not tried.
+            The rejected credential is never kept as authCredentials, so it cannot become the effective user.
+             */
+            if (ac != null && ac.isRejected()) {
+                final Optional<SecurityResponse> challengeResponse = firstChallengingHttpAuthenticator == null
+                    ? Optional.empty()
+                    : firstChallengingHttpAuthenticator.reRequestAuthentication(request, null);
+                auditLog.logFailedLogin(
+                    authCredentials == null ? "<NONE>" : authCredentials.getUsername(),
+                    false,
+                    null,
+                    request,
+                    ac.getAttemptedPrincipal(),
+                    ac.getFailureReason().name()
+                );
+                notifyIpAuthFailureListeners(request, authCredentials);
+                request.queueForSending(
+                    challengeResponse.orElseGet(() -> new SecurityResponse(SC_UNAUTHORIZED, "Authentication finally failed"))
+                );
+                return false;
+            }
+
+            /*
             User may be blocked from authenticating with this auth backend based on rate limiting configurations.
             Skip this auth domain if the user is blocked.
              */
@@ -371,8 +393,15 @@ public class BackendRegistry {
             Anonymous users are handled later outside of auth domain loop if no other user is authenticated.
             2. If auth domain is challenging and no credentials are found -> present challenge.
             SAML and basic auth for example redirect/re-request credentials from clients.
+
+            Retain credentials extracted by an earlier auth domain. In a SAML and Basic chain, Basic can reject the
+            credentials before HTTPSamlAuthenticator.extractCredentials() returns null because the request contains Basic
+            credentials. SAML still requires challenge: true in the current reRequestAuthentication flow so it can issue its
+            redirect; retaining the rejected credentials lets that challenge path audit the actual username.
              */
-            authCredentials = ac;
+            if (ac != null) {
+                authCredentials = ac;
+            }
             if (ac == null) {
                 // no credentials found in request
                 if (!gRPC && anonymousAuthEnabled && isRequestForAnonymousLogin(request.params(), request.getHeaders())) {
@@ -382,11 +411,17 @@ public class BackendRegistry {
                 if (authDomain.isChallenge()) {
                     final Optional<SecurityResponse> restResponse = httpAuthenticator.reRequestAuthentication(request, null);
                     if (restResponse.isPresent()) {
+                        final String authenticatorType = authDomain.getHttpAuthenticator().getType();
                         // saml will always hit this to re-request authentication
-                        if (!authDomain.getHttpAuthenticator().getType().equals(SAML_TYPE)) {
-                            auditLog.logFailedLogin("<NONE>", false, null, request);
+                        if (!authenticatorType.equals(SAML_TYPE) || authCredentials != null) {
+                            auditLog.logFailedLogin(
+                                authCredentials == null ? "<NONE>" : authCredentials.getUsername(),
+                                false,
+                                null,
+                                request
+                            );
                         }
-                        if (authDomain.getHttpAuthenticator().getType().equals(BASIC_TYPE)) {
+                        if (authenticatorType.equals(BASIC_TYPE)) {
                             log.warn("No 'Authorization' header, send 401 and 'WWW-Authenticate Basic'");
                         }
                         notifyIpAuthFailureListeners(request, authCredentials);
@@ -496,8 +531,7 @@ public class BackendRegistry {
             threadPool.getThreadContext().putTransient(ConfigConstants.OPENDISTRO_SECURITY_USER, effectiveUser);
             threadPool.getThreadContext().putTransient(ConfigConstants.OPENDISTRO_SECURITY_INITIATING_USER, authenticatedUser.getName());
 
-            UserSubject subject = new UserSubjectImpl(threadPool, effectiveUser);
-            threadPool.getThreadContext().putPersistent(ConfigConstants.OPENDISTRO_SECURITY_AUTHENTICATED_USER, subject);
+            threadPool.getThreadContext().putPersistent(ConfigConstants.OPENDISTRO_SECURITY_AUTHENTICATED_USER, effectiveUser);
         } else {
             if (isDebugEnabled) {
                 log.debug("User still not authenticated after checking {} auth domains", restAuthDomains.size());
@@ -541,10 +575,8 @@ public class BackendRegistry {
                     anonymousUser = anonymousUser.withRequestedTenant(tenant);
                 }
 
-                UserSubject subject = new UserSubjectImpl(threadPool, anonymousUser);
-
                 threadPool.getThreadContext().putTransient(ConfigConstants.OPENDISTRO_SECURITY_USER, anonymousUser);
-                threadPool.getThreadContext().putPersistent(ConfigConstants.OPENDISTRO_SECURITY_AUTHENTICATED_USER, subject);
+                threadPool.getThreadContext().putPersistent(ConfigConstants.OPENDISTRO_SECURITY_AUTHENTICATED_USER, anonymousUser);
                 if (isDebugEnabled) {
                     log.debug("Anonymous User is authenticated");
                 }
@@ -650,6 +682,11 @@ public class BackendRegistry {
     }
 
     private void notifyIpAuthFailureListeners(SecurityRequestChannel request, AuthCredentials authCredentials) {
+        // A request without credentials cannot guess any, and counting it lets unauthenticated traffic block a shared address.
+        // The header check keeps counting a token that its authenticator rejects during extraction, such as an invalid JWT.
+        if (authCredentials == null && request.header(HttpHeaders.AUTHORIZATION) == null) {
+            return;
+        }
         notifyIpAuthFailureListeners(request.getRemoteAddress().map(InetSocketAddress::getAddress).orElse(null), authCredentials, request);
     }
 

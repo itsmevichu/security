@@ -12,6 +12,7 @@
 package org.opensearch.security.configuration;
 
 import java.lang.reflect.Field;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -50,6 +51,7 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.MediaTypeRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.index.query.ParsedQuery;
+import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.index.reindex.ReindexAction;
 import org.opensearch.script.mustache.RenderSearchTemplateAction;
 import org.opensearch.search.DocValueFormat;
@@ -59,8 +61,10 @@ import org.opensearch.search.aggregations.BucketOrder;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalAggregations;
 import org.opensearch.search.aggregations.bucket.MultiBucketsAggregation;
+import org.opensearch.search.aggregations.bucket.global.GlobalAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.sampler.DiversifiedAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.InternalTerms;
+import org.opensearch.search.aggregations.bucket.terms.MultiTermsAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.SignificantTermsAggregationBuilder;
 import org.opensearch.search.aggregations.bucket.terms.StringTerms;
 import org.opensearch.search.aggregations.bucket.terms.StringTerms.Bucket;
@@ -70,7 +74,6 @@ import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.query.QuerySearchResult;
 import org.opensearch.secure_sm.AccessController;
 import org.opensearch.security.OpenSearchSecurityPlugin;
-import org.opensearch.security.auth.UserSubjectImpl;
 import org.opensearch.security.privileges.DocumentAllowList;
 import org.opensearch.security.privileges.PrivilegesEvaluationContext;
 import org.opensearch.security.privileges.PrivilegesEvaluationException;
@@ -87,6 +90,8 @@ import org.opensearch.security.support.ConfigConstants;
 import org.opensearch.security.support.HeaderHelper;
 import org.opensearch.security.support.SecuritySettings;
 import org.opensearch.security.support.WildcardMatcher;
+import org.opensearch.security.user.User;
+import org.opensearch.security.util.ParentChildrenQueryDetector;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 
@@ -155,6 +160,11 @@ public class DlsFlsValveImpl implements DlsFlsRequestValve {
                         config.getFieldMasking().setDfmEmptyOverridesAll(newDfmEmptyOverridesAll);
                     }
                 });
+            // Seed and keep the "allow now in DLS" flag current. Reading it from the base context (updated here)
+            // keeps the per-query DLS path off the cluster settings lookup.
+            dlsFlsBaseContext.setAllowNowInDlsQuery(SecuritySettings.ALLOW_NOW_IN_DLS.get(settings));
+            clusterService.getClusterSettings()
+                .addSettingsUpdateConsumer(SecuritySettings.ALLOW_NOW_IN_DLS, dlsFlsBaseContext::setAllowNowInDlsQuery);
         }
         this.resourceSharingEnabledSetting = resourceSharingEnabledSetting;
     }
@@ -170,8 +180,8 @@ public class DlsFlsValveImpl implements DlsFlsRequestValve {
             return true;
         }
 
-        UserSubjectImpl userSubject = (UserSubjectImpl) threadContext.getPersistent(ConfigConstants.OPENDISTRO_SECURITY_AUTHENTICATED_USER);
-        if (userSubject != null && adminDNs.isAdmin(userSubject.getUser())) {
+        User user = (User) threadContext.getPersistent(ConfigConstants.OPENDISTRO_SECURITY_AUTHENTICATED_USER);
+        if (user != null && adminDNs.isAdmin(user)) {
             return true;
         }
         OptionallyResolvedIndices resolved = context.getResolvedIndices();
@@ -187,7 +197,8 @@ public class DlsFlsValveImpl implements DlsFlsRequestValve {
                     IndexToRuleMap<DlsRestriction> sharedResourceMap = ResourceSharingDlsUtils.resourceRestrictions(
                         namedXContentRegistry,
                         resolvedIndexNames,
-                        userSubject.getUser()
+                        user,
+                        resourcePluginInfo
                     );
 
                     return DlsFilterLevelActionHandler.handle(
@@ -197,7 +208,8 @@ public class DlsFlsValveImpl implements DlsFlsRequestValve {
                         nodeClient,
                         clusterService,
                         OpenSearchSecurityPlugin.GuiceHolder.getIndicesService(),
-                        threadContext
+                        threadContext,
+                        false
                     );
                 }
             }
@@ -211,7 +223,7 @@ public class DlsFlsValveImpl implements DlsFlsRequestValve {
             && resolvedIndices.local()
                 .namesOfIndices(context.clusterState())
                 .stream()
-                .anyMatch(index -> documentAllowList.isAllowed(index, "*"))) {
+                .anyMatch(index -> documentAllowList.isAllowed(index, DocumentAllowList.ANY_DOCUMENT_ID))) {
             // The documentAllowList is needed here for Dashboards multi tenancy which can redirect index accesses to indices for which no
             // normal index privileges are present
             // If we would not use the documentAllowList here, the index would appear to be protected
@@ -230,12 +242,10 @@ public class DlsFlsValveImpl implements DlsFlsRequestValve {
                 return true;
             }
 
-            if (threadContext.getHeader(ConfigConstants.OPENDISTRO_SECURITY_FILTER_LEVEL_DLS_DONE) != null) {
+            if (threadContext.getHeader(ConfigConstants.OPENDISTRO_SECURITY_FILTER_LEVEL_DLS_DONE) != null
+                || threadContext.getHeader(ConfigConstants.OPENDISTRO_SECURITY_DLS_QUERY_FILTER_APPLIED) != null) {
                 if (log.isDebugEnabled()) {
-                    log.debug(
-                        "DLS is already done for: {}",
-                        threadContext.getHeader(ConfigConstants.OPENDISTRO_SECURITY_FILTER_LEVEL_DLS_DONE)
-                    );
+                    log.debug("DLS query handling is already done for this request");
                 }
 
                 return true;
@@ -243,6 +253,7 @@ public class DlsFlsValveImpl implements DlsFlsRequestValve {
 
             IndexToRuleMap<DlsRestriction> dlsRestrictionMap = null;
             boolean doFilterLevelDls;
+            boolean applyDlsFilterToHybridQuery = false;
 
             if (mode == Mode.FILTER_LEVEL) {
                 doFilterLevelDls = true;
@@ -257,13 +268,22 @@ public class DlsFlsValveImpl implements DlsFlsRequestValve {
                     doFilterLevelDls = true;
                     log.debug("Doing filter-level DLS due to header");
                 } else {
-                    doFilterLevelDls = dlsRestrictionMap.containsAny(DlsRestriction::containsTermLookupQuery);
+                    boolean containsTermLookupQuery = dlsRestrictionMap.containsAny(DlsRestriction::containsTermLookupQuery);
+                    doFilterLevelDls = shouldUseFilterLevelDlsInAdaptiveMode(hasDlsRestrictions, containsTermLookupQuery);
+                    applyDlsFilterToHybridQuery = shouldApplyDlsFilterToHybridQueryInAdaptiveMode(
+                        request,
+                        hasDlsRestrictions,
+                        containsTermLookupQuery,
+                        isLocalOnlyRequest(resolved)
+                    );
 
                     if (doFilterLevelDls) {
                         setDlsModeHeader(Mode.FILTER_LEVEL);
                         log.debug("Doing filter-level DLS because the query contains a TLQ");
+                    } else if (applyDlsFilterToHybridQuery) {
+                        log.debug("Applying DLS to the top-level hybrid query while preserving reader-level DLS");
                     } else {
-                        log.debug("Doing lucene-level DLS because the query does not contain a TLQ");
+                        log.debug("Not using filter-level DLS because it is not required for this request");
                     }
                 }
             }
@@ -392,11 +412,8 @@ public class DlsFlsValveImpl implements DlsFlsRequestValve {
                     if (source != null) {
                         AggregatorFactories.Builder aggregations = source.aggregations();
                         if (aggregations != null) {
-                            for (AggregationBuilder factory : aggregations.getAggregatorFactories()) {
-                                if (factory instanceof TermsAggregationBuilder && ((TermsAggregationBuilder) factory).minDocCount() == 0) {
-                                    listener.onFailure(new OpenSearchException("min_doc_count 0 is not supported when DLS is activated"));
-                                    return false;
-                                }
+                            if (containsUnsafeDlsAggregation(aggregations.getAggregatorFactories(), listener)) {
+                                return false;
                             }
                         }
 
@@ -409,7 +426,7 @@ public class DlsFlsValveImpl implements DlsFlsRequestValve {
                 }
             }
 
-            if (doFilterLevelDls && hasDlsRestrictions) {
+            if ((doFilterLevelDls || applyDlsFilterToHybridQuery) && hasDlsRestrictions) {
                 return DlsFilterLevelActionHandler.handle(
                     context,
                     dlsRestrictionMap,
@@ -417,7 +434,8 @@ public class DlsFlsValveImpl implements DlsFlsRequestValve {
                     nodeClient,
                     clusterService,
                     OpenSearchSecurityPlugin.GuiceHolder.getIndicesService(),
-                    threadContext
+                    threadContext,
+                    applyDlsFilterToHybridQuery
                 );
             } else {
                 return true;
@@ -431,6 +449,39 @@ public class DlsFlsValveImpl implements DlsFlsRequestValve {
             log.error(e);
             throw e;
         }
+    }
+
+    static boolean shouldUseFilterLevelDlsInAdaptiveMode(boolean hasDlsRestrictions, boolean containsTermLookupQuery) {
+        return hasDlsRestrictions && containsTermLookupQuery;
+    }
+
+    static boolean shouldApplyDlsFilterToHybridQueryInAdaptiveMode(
+        ActionRequest request,
+        boolean hasDlsRestrictions,
+        boolean containsTermLookupQuery,
+        boolean localOnlyRequest
+    ) {
+        return hasDlsRestrictions
+            && !containsTermLookupQuery
+            && localOnlyRequest
+            && isTopLevelHybridQueryWithoutParentChildClauses(request);
+    }
+
+    static boolean isLocalOnlyRequest(OptionallyResolvedIndices resolved) {
+        return resolved instanceof ResolvedIndices resolvedIndices && resolvedIndices.remote().isEmpty();
+    }
+
+    private static boolean isTopLevelHybridQueryWithoutParentChildClauses(ActionRequest request) {
+        if (!(request instanceof SearchRequest searchRequest)) {
+            return false;
+        }
+
+        SearchSourceBuilder source = searchRequest.source();
+        if (source == null) {
+            return false;
+        }
+        QueryBuilder query = source.query();
+        return DlsFilterLevelActionHandler.isHybridQuery(query) && !ParentChildrenQueryDetector.hasParentOrChildQuery(query);
     }
 
     @Override
@@ -481,7 +532,7 @@ public class DlsFlsValveImpl implements DlsFlsRequestValve {
                 // - DLS rules which use "term lookup queries" and thus need to access indices for which no privileges are present
                 // - Dashboards multi tenancy which can redirect index accesses to indices for which no normal index privileges are present
 
-                if (!dlsRestriction.isUnrestricted() && documentAllowList.isAllowed(index, "*")) {
+                if (!dlsRestriction.isUnrestricted() && documentAllowList.isAllowed(index, DocumentAllowList.ANY_DOCUMENT_ID)) {
                     dlsRestriction = DlsRestriction.NONE;
                     log.debug("Lifting DLS for {} due to present document allowlist", index);
                 }
@@ -497,6 +548,14 @@ public class DlsFlsValveImpl implements DlsFlsRequestValve {
             }
 
             if (!dlsRestriction.isUnrestricted()) {
+                if (dlsFlsBaseContext.isDlsQueryFilterApplied()) {
+                    // The top-level hybrid filter already protects hits, so parsed-query rewriting is not needed here.
+                    // The dedicated marker keeps reader-level DLS active for aggregations, suggestions, and other paths.
+                    // This check intentionally follows the star-tree safeguard above.
+                    log.trace("handleSearchContext(): DLS is applied to the hybrid query; preserving reader-level DLS");
+                    return;
+                }
+
                 if (mode == Mode.ADAPTIVE && dlsRestriction.containsTermLookupQuery()) {
                     // Special case for scroll operations:
                     // Normally, the check dlsFlsBaseContext.isDlsDoneOnFilterLevel() already aborts early if DLS filter level mode
@@ -672,6 +731,35 @@ public class DlsFlsValveImpl implements DlsFlsRequestValve {
         } else {
             return null;
         }
+    }
+
+    /**
+     * Recursively checks the aggregation tree for aggregations that are unsafe under DLS.
+     * Blocks:
+     * - GlobalAggregationBuilder (ignores DLS query filter entirely)
+     * - TermsAggregationBuilder with min_doc_count == 0 (leaks field values from restricted docs)
+     * - MultiTermsAggregationBuilder with min_doc_count == 0 (same as above)
+     * Returns true if an unsafe aggregation is found (and fires listener.onFailure).
+     */
+    private boolean containsUnsafeDlsAggregation(Collection<AggregationBuilder> aggregations, ActionListener<?> listener) {
+        for (AggregationBuilder agg : aggregations) {
+            if (agg instanceof GlobalAggregationBuilder) {
+                listener.onFailure(new OpenSearchException("global aggregations are not supported when DLS is activated"));
+                return true;
+            }
+            if (agg instanceof TermsAggregationBuilder && ((TermsAggregationBuilder) agg).minDocCount() == 0) {
+                listener.onFailure(new OpenSearchException("min_doc_count 0 is not supported when DLS is activated"));
+                return true;
+            }
+            if (agg instanceof MultiTermsAggregationBuilder && ((MultiTermsAggregationBuilder) agg).minDocCount() == 0) {
+                listener.onFailure(new OpenSearchException("min_doc_count 0 is not supported when DLS is activated"));
+                return true;
+            }
+            if (!agg.getSubAggregations().isEmpty() && containsUnsafeDlsAggregation(agg.getSubAggregations(), listener)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static class BucketMerger implements Consumer<Bucket> {

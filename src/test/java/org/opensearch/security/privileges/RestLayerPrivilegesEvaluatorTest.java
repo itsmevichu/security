@@ -11,6 +11,7 @@
 
 package org.opensearch.security.privileges;
 
+import java.util.List;
 import java.util.Set;
 import java.util.function.Supplier;
 
@@ -163,7 +164,8 @@ public class RestLayerPrivilegesEvaluatorTest {
                     null,
                     null,
                     null,
-                    actionPrivileges
+                    actionPrivileges,
+                    List.of()
                 );
             }
 
@@ -202,8 +204,8 @@ public class RestLayerPrivilegesEvaluatorTest {
             }
 
             @Override
-            public PrivilegesEvaluatorType type() {
-                return PrivilegesEvaluatorType.LEGACY;
+            public PrivilegeEvaluationMode mode() {
+                return PrivilegeEvaluationMode.LEGACY;
             }
         };
 

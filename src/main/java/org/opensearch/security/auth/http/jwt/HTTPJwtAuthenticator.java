@@ -36,10 +36,12 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.secure_sm.AccessController;
 import org.opensearch.security.DefaultObjectMapper;
+import org.opensearch.security.auth.AuthenticationFailureReason;
 import org.opensearch.security.auth.HTTPAuthenticator;
 import org.opensearch.security.filter.SecurityRequest;
 import org.opensearch.security.filter.SecurityResponse;
 import org.opensearch.security.user.AuthCredentials;
+import org.opensearch.security.user.User;
 import org.opensearch.security.util.KeyUtils;
 
 import com.nimbusds.jwt.proc.BadJWTException;
@@ -67,6 +69,7 @@ public class HTTPJwtAuthenticator implements HTTPAuthenticator {
     private final List<String> requiredAudience;
     private final String requireIssuer;
     private final int clockSkewToleranceSeconds;
+    private final Set<String> forbiddenSubjects;
 
     public HTTPJwtAuthenticator(final Settings settings, final Path configPath) {
         super();
@@ -108,15 +111,13 @@ public class HTTPJwtAuthenticator implements HTTPAuthenticator {
             }
             jwtParsers.add(jwtParser);
         }
+        this.forbiddenSubjects = Set.copyOf(settings.getAsList("forbidden_subjects", List.of()));
     }
 
     @Override
     public AuthCredentials extractCredentials(final SecurityRequest request, final ThreadContext context)
         throws OpenSearchSecurityException {
-
-        AuthCredentials creds = AccessController.doPrivileged(() -> extractCredentials0(request));
-
-        return creds;
+        return AccessController.doPrivileged(() -> extractCredentials0(request));
     }
 
     private AuthCredentials extractCredentials0(final SecurityRequest request) {
@@ -172,6 +173,14 @@ public class HTTPJwtAuthenticator implements HTTPAuthenticator {
                 if (subject == null) {
                     log.error("No subject found in JWT token");
                     return null;
+                }
+                if (User.hasReservedPrefix(subject)) {
+                    log.warn("JWT subject uses a reserved security prefix");
+                    return AuthCredentials.rejected(subject, AuthenticationFailureReason.RESERVED_SUBJECT_PREFIX);
+                }
+                if (forbiddenSubjects.contains(subject)) {
+                    log.warn("JWT subject is forbidden");
+                    return AuthCredentials.rejected(subject, AuthenticationFailureReason.FORBIDDEN_SUBJECT);
                 }
 
                 final String[] roles = extractRoles(claims);

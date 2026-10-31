@@ -43,6 +43,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import org.opensearch.OpenSearchException;
+import org.opensearch.common.UUIDs;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.core.rest.RestStatus;
@@ -61,7 +62,9 @@ import org.opensearch.security.configuration.AdminDNs;
 import org.opensearch.security.configuration.CompatConfig;
 import org.opensearch.security.dlic.rest.api.AllowlistApiAction;
 import org.opensearch.security.privileges.PrivilegesEvaluatorResponse;
+import org.opensearch.security.privileges.RestAdminRoles;
 import org.opensearch.security.privileges.RestLayerPrivilegesEvaluator;
+import org.opensearch.security.privileges.dlsfls.DlsRequestHeadersUtil;
 import org.opensearch.security.securityconf.impl.AllowlistingSettings;
 import org.opensearch.security.ssl.http.netty.Netty4HttpRequestHeaderVerifier;
 import org.opensearch.security.ssl.transport.PrincipalExtractor;
@@ -71,6 +74,7 @@ import org.opensearch.security.ssl.util.SSLRequestHelper.SSLInfo;
 import org.opensearch.security.support.ConfigConstants;
 import org.opensearch.security.support.HTTPHelper;
 import org.opensearch.security.user.User;
+import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -93,6 +97,7 @@ public class SecurityRestFilter {
     private final Settings settings;
     private final Path configPath;
     private final CompatConfig compatConfig;
+    private final RestAdminRoles restAdminRoles;
 
     private AllowlistingSettings allowlistingSettings;
 
@@ -121,6 +126,7 @@ public class SecurityRestFilter {
         this.settings = settings;
         this.configPath = configPath;
         this.compatConfig = compatConfig;
+        this.restAdminRoles = new RestAdminRoles(settings);
         this.allowlistingSettings = new AllowlistingSettings();
     }
 
@@ -176,11 +182,19 @@ public class SecurityRestFilter {
                 }
             });
 
+            // Stash audit correlation ID: use X-Request-Id header if present, otherwise generate UUID
+            if (threadContext.getTransient(ConfigConstants.SECURITY_AUDIT_REQUEST_ID) == null) {
+                String requestId = sanitizeRequestId(threadContext.getHeader(Task.X_REQUEST_ID));
+                threadContext.putTransient(ConfigConstants.SECURITY_AUDIT_REQUEST_ID, requestId);
+            }
+
             RestRequest filteredRequest = maybeFilterRestRequest(request);
 
             final SecurityRequestChannel requestChannel = SecurityRequestFactory.from(request, channel);
             // for audit logging
             final SecurityRequestChannel filteredRequestChannel = SecurityRequestFactory.from(filteredRequest, channel);
+
+            DlsRequestHeadersUtil.extractAndStoreDlsRequestHeaders(requestChannel, threadContext, settings);
 
             // Authenticate request
             if (!NettyAttribute.popFrom(request, Netty4HttpRequestHeaderVerifier.IS_AUTHENTICATED).orElse(false)) {
@@ -275,9 +289,21 @@ public class SecurityRestFilter {
     }
 
     /**
-     * Specialized authorization for NamedRoute APIs only.
-     * Allows extension and plugin developers to apply authorization directly to an API route, in contrast to
-     * typical OpenSearch authorization which is handled at the node-to-node layer.
+     * Authorizes REST routes without replacing authorization of the transport actions they execute.
+     *
+     * <p>An {@code ADMINISTRATIVE} route requires at least one mapped security role listed in
+     * {@code plugins.security.restapi.roles_enabled}. This is an additional gate, not a grant of action permissions:
+     * any {@link NamedRoute} permissions are checked below, and the handler's transport actions still pass through
+     * {@link SecurityFilter}. For example, Job Scheduler's list-jobs API also requires the cluster permission
+     * {@code cluster:admin/opensearch/jobscheduler/jobs/all}. The enabled role and action permission may come from
+     * different roles. Raw backend-role names do not satisfy this gate unless mapped to an enabled security role.
+     *
+     * <p>Unlike the Security management APIs, marking a plugin route administrative does not make membership in
+     * an enabled role sufficient to execute its operations. This check neither elevates the caller nor changes
+     * their thread context. Security-specific endpoint restrictions and granular {@code restapi:admin/...}
+     * permissions do not apply here. Admin-certificate requests bypass this method in the calling handler.
+     * Unmarked routes retain their existing authorization behavior.
+     *
      * @param original REST handler originating request
      * @param request security representation of request metadata
      * @param user authenticated user
@@ -288,6 +314,19 @@ public class SecurityRestFilter {
             .filter(rh -> rh.getMethod().equals(request.method()))
             .filter(rh -> restPathMatches(request.path(), rh.getPath()))
             .findFirst();
+        // Administrative metadata adds a role gate; it does not replace route or transport action permissions.
+        if (handler.isPresent()
+            && handler.get().hasProperty(RestHandler.Route.Property.ADMINISTRATIVE)
+            && !evaluator.isRestAdmin(user, restAdminRoles)) {
+            auditLog.logMissingPrivileges(request.path(), user == null ? null : user.getName(), request);
+            request.queueForSending(
+                new SecurityResponse(
+                    HttpStatus.SC_FORBIDDEN,
+                    "Administrative routes require a role listed in " + ConfigConstants.SECURITY_RESTAPI_ROLES_ENABLED
+                )
+            );
+            return;
+        }
         final boolean routeSupportsRestAuthorization = handler.isPresent() && handler.get() instanceof NamedRoute;
         if (routeSupportsRestAuthorization) {
             PrivilegesEvaluatorResponse pres;
@@ -310,7 +349,7 @@ public class SecurityRestFilter {
                 String err = String.format("no permissions for %s and %s", pres.getMissingPrivileges(), user);
                 log.debug(err);
 
-                request.queueForSending(new SecurityResponse(HttpStatus.SC_UNAUTHORIZED, err));
+                request.queueForSending(new SecurityResponse(HttpStatus.SC_FORBIDDEN, err));
             }
         }
     }
@@ -407,5 +446,27 @@ public class SecurityRestFilter {
             }
         }
         return true;
+    }
+
+    /** Pre-compiled pattern for control character stripping — avoids recompilation on every call. */
+    private static final Pattern CONTROL_CHARS = Pattern.compile("\\p{Cntrl}");
+
+    /**
+     * Sanitizes a raw X-Request-Id header value for use as an audit correlation ID.
+     * Strips control characters to prevent log injection. Does not truncate — core's
+     * http.request_id.max_length setting already validates length before the header reaches us.
+     * Returns null if the input reduces to empty after sanitization (caller should skip storing).
+     */
+    public static String sanitizeRequestId(String rawRequestId) {
+        if (rawRequestId == null || rawRequestId.isEmpty()) {
+            return UUIDs.base64UUID();
+        }
+        rawRequestId = CONTROL_CHARS.matcher(rawRequestId).replaceAll("");
+        if (rawRequestId.isEmpty()) {
+            // Header was entirely control chars — unusable. Return null so each node
+            // doesn't independently generate a different ID (which defeats correlation).
+            return null;
+        }
+        return rawRequestId;
     }
 }

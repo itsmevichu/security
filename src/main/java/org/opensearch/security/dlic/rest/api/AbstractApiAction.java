@@ -12,6 +12,7 @@
 package org.opensearch.security.dlic.rest.api;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -38,6 +39,7 @@ import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.ToXContent;
+import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentHelper;
 import org.opensearch.index.engine.VersionConflictEngineException;
 import org.opensearch.rest.BaseRestHandler;
@@ -49,15 +51,24 @@ import org.opensearch.rest.RestRequestFilter;
 import org.opensearch.security.action.configupdate.ConfigUpdateAction;
 import org.opensearch.security.action.configupdate.ConfigUpdateRequest;
 import org.opensearch.security.action.configupdate.ConfigUpdateResponse;
+import org.opensearch.security.action.configupdate.SecurityConfigWriteAction;
+import org.opensearch.security.action.configupdate.SecurityConfigWriteRequest;
+import org.opensearch.security.dlic.rest.api.pagination.PaginationCursor;
+import org.opensearch.security.dlic.rest.api.pagination.PaginationParams;
+import org.opensearch.security.dlic.rest.api.pagination.PaginationRequestParser;
+import org.opensearch.security.dlic.rest.api.pagination.PaginationResult;
+import org.opensearch.security.dlic.rest.api.pagination.Paginator;
 import org.opensearch.security.dlic.rest.support.Utils;
 import org.opensearch.security.dlic.rest.validation.EndpointValidator;
 import org.opensearch.security.dlic.rest.validation.RequestContentValidator;
+import org.opensearch.security.dlic.rest.validation.SecurityApiRequestValidator;
 import org.opensearch.security.dlic.rest.validation.ValidationResult;
 import org.opensearch.security.filter.SecurityRequestFactory;
 import org.opensearch.security.securityconf.DynamicConfigFactory;
 import org.opensearch.security.securityconf.impl.CType;
 import org.opensearch.security.securityconf.impl.SecurityDynamicConfiguration;
 import org.opensearch.security.support.ConfigConstants;
+import org.opensearch.security.support.SecuritySettings;
 import org.opensearch.security.user.User;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
@@ -121,11 +132,106 @@ public abstract class AbstractApiAction extends BaseRestHandler implements RestR
     private void buildDefaultRequestHandlers(final RequestHandler.RequestHandlersBuilder builder) {
         builder.withAccessHandler(request -> securityApiDependencies.restApiAuthorizationEvaluator().isCurrentUserAdminFor(endpoint))
             .withSaveOrUpdateConfigurationHandler(this::saveOrUpdateConfiguration)
+            .withAsyncTaskSubmitter(this::maybeSubmitAsTask)
             .add(Method.POST, methodNotImplementedHandler)
             .add(Method.PATCH, methodNotImplementedHandler)
             .onGetRequest(this::processGetRequest)
+            .withPaginatedGetRequest(this::routeGetRequest)
             .onChangeRequest(Method.DELETE, this::processDeleteRequest)
             .onChangeRequest(Method.PUT, this::processPutRequest);
+    }
+
+    /**
+     * Endpoint-level opt-in for the {@code wait_for_completion} query parameter and the OpenSearch
+     * task framework. When {@code false} (the default), every change request is handled fully
+     * synchronously and {@code wait_for_completion} is ignored, exactly matching the pre-existing
+     * behavior. Subclasses that override this to {@code true} allow callers to pass
+     * {@code wait_for_completion=false}, in which case the update is submitted as a Task and
+     * {@code {"task":"nodeId:taskId"}} is returned immediately.
+     */
+    protected boolean supportsAsync() {
+        return false;
+    }
+
+    /**
+     * Pre-branch invoked from {@link RequestHandler.RequestHandlersBuilder#onChangeRequest} before
+     * the sync save path. Returns {@code true} only when the endpoint has opted in via
+     * {@link #supportsAsync()} <b>and</b> the caller passed {@code wait_for_completion=false} — the
+     * update is then dispatched through the task framework, a task-id response is written to the
+     * channel, and the caller is expected to skip the sync path.
+     *
+     * <p>Any other combination returns {@code false}, so the existing sync path handles the request
+     * unchanged.
+     */
+    private boolean maybeSubmitAsTask(
+        final RestChannel channel,
+        final RestRequest request,
+        final Client client,
+        final SecurityDynamicConfiguration<?> configuration,
+        final String entityName,
+        final String successMessage,
+        final RestStatus successStatus
+    ) {
+        if (!supportsAsync()) {
+            return false;
+        }
+        if (request.paramAsBoolean("wait_for_completion", true)) {
+            return false;
+        }
+        if (!(client instanceof NodeClient)) {
+            // Defensive: this handler always runs off a NodeClient today, so this branch is
+            // effectively unreachable — but avoid a runtime ClassCastException if that ever
+            // changes and gracefully fall back to sync execution.
+            LOGGER.debug("Client is not a NodeClient; cannot submit as task, falling back to sync path");
+            return false;
+        }
+        final NodeClient nodeClient = (NodeClient) client;
+        final CType<?> cType = getConfigType();
+
+        // Build the IndexRequest using the same helper the sync path uses, so async and sync
+        // writes stay byte-identical. Includes seqNo/primaryTerm preconditions for optimistic
+        // concurrency and the correct refresh policy for security-index writes.
+        final IndexRequest indexRequest = createIndexRequestForConfig(securityApiDependencies, cType, configuration);
+
+        final String description = entityName == null ? cType.toLCString() : cType.toLCString() + "/" + entityName;
+        final SecurityConfigWriteRequest updateRequest = new SecurityConfigWriteRequest(
+            indexRequest,
+            cType.toLCString(),
+            description,
+            successMessage,
+            successStatus
+        );
+
+        // Persist the eventual task result in .tasks so callers can retrieve it via
+        // GET /_tasks/{task_id} after completion. The request itself always signals this via
+        // getShouldStoreResult() — see SecurityConfigWriteRequest.
+        final org.opensearch.tasks.Task task = nodeClient.executeLocally(
+            SecurityConfigWriteAction.INSTANCE,
+            updateRequest,
+            org.opensearch.tasks.LoggingTaskListener.instance()
+        );
+
+        try (final XContentBuilder builder = channel.newBuilder()) {
+            builder.startObject();
+            builder.field("task", nodeClient.getLocalNodeId() + ":" + task.getId());
+            builder.endObject();
+            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
+        } catch (final IOException e) {
+            throw ExceptionsHelper.convertToOpenSearchException(e);
+        }
+        return true;
+    }
+
+    /**
+     * Routes a GET to the paginated path when pagination parameters are present,
+     * or falls back to the legacy handler.
+     *
+     */
+    protected ValidationResult<ToXContent> routeGetRequest(final RestRequest request) throws IOException {
+        if (PaginationRequestParser.isPaginationRequested(request)) {
+            return processPaginatedGetRequest(request);
+        }
+        return null;
     }
 
     protected final ValidationResult<SecurityConfiguration> processDeleteRequest(final RestRequest request) throws IOException {
@@ -148,6 +254,59 @@ public abstract class AbstractApiAction extends BaseRestHandler implements RestR
             securityConfiguration.configuration().removeOthers(entityName);
             return ValidationResult.success(securityConfiguration);
         }).orElse(ValidationResult.success(securityConfiguration)));
+    }
+
+    /**
+     * Handles a collection GET with pagination parameters.
+     */
+    protected ValidationResult<ToXContent> processPaginatedGetRequest(final RestRequest request) throws IOException {
+        return PaginationRequestParser.parse(request).map(params -> {
+            if (nameParam(request) != null) {
+                return ValidationResult.error(
+                    RestStatus.BAD_REQUEST,
+                    badRequestMessage("Pagination parameters are not supported for single-entity GET requests.")
+                );
+            }
+            return loadConfiguration(getConfigType(), true, true).map(
+                configuration -> ValidationResult.success(SecurityConfiguration.of(null, configuration))
+            ).map(endpointValidator::onConfigLoad).map(securityConfiguration -> {
+                final SecurityDynamicConfiguration<?> configuration = securityConfiguration.configuration();
+                postLoadForPagination(request, configuration);
+                if (params.hasCursor()) {
+                    return PaginationCursor.decode(params.nextToken, getConfigType(), params.sort)
+                        .map(cursor -> buildPaginatedPage(configuration, params, cursor));
+                }
+                return buildPaginatedPage(configuration, params, null);
+            });
+        });
+    }
+
+    /**
+     * Hook for subclasses to apply endpoint-specific post-load transformations
+     * (e.g. filtering or augmentation) to the configuration before it is paginated.
+     * The default implementation is a no-op.
+     *
+     * @param request       the incoming REST request (carries query params like {@code filterBy}, {@code show_all})
+     * @param configuration the fully loaded and redacted configuration to mutate in place
+     */
+    protected void postLoadForPagination(final RestRequest request, final SecurityDynamicConfiguration<?> configuration) {}
+
+    /**
+     * Builds a single page from the fully-loaded configuration.
+     *
+     * @param configuration fully loaded and redacted configuration
+     * @param params        validated pagination parameters
+     * @param cursor        pre-validated cursor from a prior page
+     * @return a {@link ValidationResult}
+     */
+    @SuppressWarnings("unchecked")
+    protected <T> ValidationResult<ToXContent> buildPaginatedPage(
+        final SecurityDynamicConfiguration<?> configuration,
+        final PaginationParams params,
+        final PaginationCursor cursor
+    ) {
+        final PaginationResult<T> page = Paginator.paginate((Map<String, T>) configuration.getCEntries(), params, cursor, getConfigType());
+        return ValidationResult.success(page);
     }
 
     /**
@@ -325,7 +484,11 @@ public abstract class AbstractApiAction extends BaseRestHandler implements RestR
     }
 
     protected final ValidationResult<SecurityConfiguration> processPutRequest(final RestRequest request) throws IOException {
-        return processPutRequest(nameParam(request), request);
+        final String entityName = nameParam(request);
+        if (entityName != null) {
+            return processPutRequest(entityName, request);
+        }
+        return processBulkPutRequest(request);
     }
 
     protected final ValidationResult<SecurityConfiguration> processPutRequest(final String entityName, final RestRequest request)
@@ -334,6 +497,69 @@ public abstract class AbstractApiAction extends BaseRestHandler implements RestR
             .map(ignore -> loadConfigurationWithRequestContent(entityName, request))
             .map(endpointValidator::onConfigChange)
             .map(this::addEntityToConfig);
+    }
+
+    private ValidationResult<SecurityConfiguration> processBulkPutRequest(final RestRequest request) throws IOException {
+        final JsonNode requestContent;
+        try {
+            requestContent = Utils.toJsonNode(request.content().utf8ToString());
+        } catch (IOException e) {
+            return ValidationResult.error(RestStatus.BAD_REQUEST, badRequestMessage("Request body must be valid JSON."));
+        }
+        if (requestContent.isObject() == false || requestContent.isEmpty()) {
+            return ValidationResult.error(
+                RestStatus.BAD_REQUEST,
+                badRequestMessage("Request body must be a non-empty object keyed by resource name.")
+            );
+        }
+        final int maxEntries = clusterService.getClusterSettings().get(SecuritySettings.RESTAPI_BULK_MAX_ENTRIES);
+        if (requestContent.size() > maxEntries) {
+            return ValidationResult.error(
+                RestStatus.BAD_REQUEST,
+                badRequestMessage("Request contains " + requestContent.size() + " resources; the maximum is " + maxEntries + ".")
+            );
+        }
+
+        return loadConfiguration(getConfigType(), false, false).map(
+            configuration -> validateAndAddEntities(request, requestContent, configuration)
+        );
+    }
+
+    private ValidationResult<SecurityConfiguration> validateAndAddEntities(
+        final RestRequest request,
+        final JsonNode requestContent,
+        final SecurityDynamicConfiguration<?> configuration
+    ) throws IOException {
+        final List<SecurityConfiguration> securityConfigurations = new ArrayList<>(requestContent.size());
+        for (final var entity : requestContent.properties()) {
+            final String entityName = entity.getKey();
+            final JsonNode entityContent = entity.getValue();
+            final var entityNameValidation = endpointValidator.withRequiredEntityName(entityName.isEmpty() ? null : entityName);
+            if (entityNameValidation.isValid() == false) {
+                return ValidationResult.error(entityNameValidation.status(), entityNameValidation.errorMessage());
+            }
+            if (entityContent.isObject() == false) {
+                return ValidationResult.error(
+                    RestStatus.BAD_REQUEST,
+                    badRequestMessage("Resource '" + entityName + "' must be a JSON object.")
+                );
+            }
+
+            final var contentValidation = endpointValidator.createRequestContentValidator(entityName).validate(request, entityContent);
+            if (contentValidation.isValid() == false) {
+                return ValidationResult.error(contentValidation.status(), contentValidation.errorMessage());
+            }
+            securityConfigurations.add(SecurityConfiguration.of(entityContent, entityName, configuration));
+        }
+        final var changeValidation = endpointValidator.onConfigChange(securityConfigurations);
+        if (changeValidation.isValid() == false) {
+            return ValidationResult.error(changeValidation.status(), changeValidation.errorMessage());
+        }
+
+        for (final var entity : requestContent.properties()) {
+            configuration.putCObject(entity.getKey(), Utils.toConfigObject(entity.getValue(), configuration.getImplementingClass()));
+        }
+        return ValidationResult.success(SecurityConfiguration.of(null, configuration));
     }
 
     protected final ValidationResult<SecurityConfiguration> addEntityToConfig(final SecurityConfiguration securityConfiguration)
@@ -519,7 +745,13 @@ public abstract class AbstractApiAction extends BaseRestHandler implements RestR
         client.index(ir, new ConfigUpdatingActionListener<>(new String[] { cType.toLCString() }, client, actionListener));
     }
 
-    private static IndexRequest createIndexRequestForConfig(
+    /**
+     * Build the {@link IndexRequest} that persists a {@link SecurityDynamicConfiguration} document
+     * to the security index. Exposed for reuse by the async task path
+     * ({@link org.opensearch.security.action.configupdate.TransportSecurityConfigWriteAction}) so
+     * that the sync and async write flows share one implementation.
+     */
+    public static IndexRequest createIndexRequestForConfig(
         final SecurityApiDependencies dependencies,
         final CType<?> cType,
         final SecurityDynamicConfiguration<?> configuration
@@ -539,7 +771,13 @@ public abstract class AbstractApiAction extends BaseRestHandler implements RestR
             .source(cType.toLCString(), content);
     }
 
-    protected static class ConfigUpdatingActionListener<Response> implements ActionListener<Response> {
+    /**
+     * Wraps an {@link ActionListener} so that after a successful config-index write it fans a
+     * {@link ConfigUpdateAction} out to every node, and only completes the delegate listener once
+     * every node has acknowledged the reload. Exposed for reuse by the async task path — sync and
+     * async writes both go through this listener so their completion semantics stay in lockstep.
+     */
+    public static class ConfigUpdatingActionListener<Response> implements ActionListener<Response> {
         private final String[] cTypes;
         private final Client client;
         private final ActionListener<Response> delegate;
@@ -591,6 +829,10 @@ public abstract class AbstractApiAction extends BaseRestHandler implements RestR
         // consume all parameters first so we can return a correct HTTP status,
         // not 400
         consumeParameters(request);
+        // Consume the async opt-in flag centrally (not in consumeParameters), so subclasses that
+        // override consumeParameters — and don't call super — still don't reject
+        // ?wait_for_completion=... as an unrecognized parameter.
+        request.paramAsBoolean("wait_for_completion", true);
 
         // check if .opendistro_security index has been initialized
         if (!ensureIndexExists()) {
@@ -610,6 +852,12 @@ public abstract class AbstractApiAction extends BaseRestHandler implements RestR
             return channel -> forbidden(channel, "No permission to access REST API: " + authError);
         } else {
             securityApiDependencies.auditLog().logGrantedPrivileges(userName, SecurityRequestFactory.from(auditLogRequest));
+        }
+
+        // Shared by all endpoint handlers, including overrides and asynchronous config writes.
+        final var requestValidation = SecurityApiRequestValidator.validate(request);
+        if (!requestValidation.isValid()) {
+            return channel -> Responses.response(channel, requestValidation.status(), requestValidation.errorMessage());
         }
 
         final var originalUserAndRemoteAddress = Utils.userAndRemoteAddressFrom(threadPool.getThreadContext());
@@ -649,6 +897,9 @@ public abstract class AbstractApiAction extends BaseRestHandler implements RestR
      */
     protected void consumeParameters(final RestRequest request) {
         request.param("name");
+        request.param(PaginationRequestParser.PARAM_SIZE);
+        request.param(PaginationRequestParser.PARAM_SORT);
+        request.param(PaginationRequestParser.PARAM_NEXT_TOKEN);
     }
 
     @Override

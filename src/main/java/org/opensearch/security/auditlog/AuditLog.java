@@ -36,6 +36,7 @@ import org.opensearch.index.engine.Engine.Index;
 import org.opensearch.index.engine.Engine.IndexResult;
 import org.opensearch.index.get.GetResult;
 import org.opensearch.security.auditlog.config.AuditConfig;
+import org.opensearch.security.auditlog.impl.AuditMessage;
 import org.opensearch.security.compliance.ComplianceConfig;
 import org.opensearch.security.filter.SecurityRequest;
 import org.opensearch.tasks.Task;
@@ -45,6 +46,36 @@ public interface AuditLog extends Closeable {
 
     // login
     void logFailedLogin(String effectiveUser, boolean securityadmin, String initiatingUser, SecurityRequest request);
+
+    /**
+     * Record a failed login event with an attempted principal and structured failure reason.
+     *
+     * <p>Use this overload when an authenticator rejects a candidate credential before an
+     * identity is established — for example a JWT whose subject uses a reserved security
+     * prefix. {@code effectiveUser} is expected to be {@code null} (rendered as
+     * {@code <NONE>} downstream) so callers do not conflate an attempted principal with an
+     * established one.</p>
+     *
+     * <p>Implementations that do not care about the additional fields SHOULD leave this
+     * default in place, which delegates to the four-argument overload.</p>
+     *
+     * @param effectiveUser  established effective user, or {@code null} if none
+     * @param securityadmin  whether the attempt was flagged as a security-admin attempt
+     * @param initiatingUser initiating user (may be null)
+     * @param request        the security request
+     * @param attemptedUser  attempted principal from the rejected credential (may be null)
+     * @param failureReason  serialized failure-reason enum name (may be null)
+     */
+    default void logFailedLogin(
+        String effectiveUser,
+        boolean securityadmin,
+        String initiatingUser,
+        SecurityRequest request,
+        String attemptedUser,
+        String failureReason
+    ) {
+        logFailedLogin(effectiveUser, securityadmin, initiatingUser, request);
+    }
 
     void logSucceededLogin(String effectiveUser, boolean securityadmin, String initiatingUser, SecurityRequest request);
 
@@ -59,6 +90,11 @@ public interface AuditLog extends Closeable {
 
     // index event requests
     void logIndexEvent(String privilege, TransportRequest request, Task task);
+
+    // standalone audit (non-FGAC modes)
+    void logRequestAudit(AuditMessage msg);
+
+    void logTransportAudit(AuditMessage msg);
 
     // settings change events
     void logSettingsChange(String action, TransportRequest request, Task task);
@@ -84,6 +120,53 @@ public interface AuditLog extends Closeable {
     void logApiTokenCreated(String tokenName, String createdBy);
 
     void logApiTokenRevoked(String tokenId, String revokedBy);
+
+    // Resource Sharing events
+    void logResourceAccessGranted(
+        String action,
+        String resourceId,
+        String resourceType,
+        String resourceIndex,
+        TransportRequest request,
+        Task task
+    );
+
+    void logResourceAccessDenied(
+        String action,
+        String resourceId,
+        String resourceType,
+        String resourceIndex,
+        TransportRequest request,
+        Task task
+    );
+
+    /**
+     * Logs a resource sharing mutation event (RESOURCE_SHARING_CHANGED category).
+     * This method is called for both successful and failed sharing operations:
+     * successful mutations use sharingAction "share" or "patch" with result "success",
+     * while internal failures after authorization use the same action with result "failed".
+     *
+     * @param resourceId        the ID of the resource being shared
+     * @param resourceType      the type of the resource (e.g., "saved_query", "dashboard")
+     * @param sharingAction     the mutation action: "share" for PUT, "patch" for PATCH/POST
+     * @param sharingResult     the outcome: "success" or "failed"
+     * @param recipientsAdded   serialized recipients added (for PATCH), or null
+     * @param recipientsRevoked serialized recipients revoked (for PATCH), or null
+     * @param shareWith         serialized full sharing target (for PUT), or null
+     * @param request           the originating transport request
+     * @param task              the task associated with the request
+     */
+    void logResourceSharingChanged(
+        String resourceId,
+        String resourceType,
+        String sharingAction,
+        String sharingResult,
+        String recipientsAdded,
+        String recipientsRevoked,
+        String shareWith,
+        TransportRequest request,
+        Task task
+    );
 
     // compliance config
     ComplianceConfig getComplianceConfig();

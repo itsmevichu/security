@@ -1,4 +1,5 @@
 /*
+ * SPDX-License-Identifier: Apache-2.0
  * Copyright 2015-2017 floragunn GmbH
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -155,6 +156,18 @@ public class SSLRequestHelper {
         X509Certificate[] localCerts = null;
         if (session.getLocalCertificates() != null) {
             localCerts = Arrays.stream(session.getLocalCertificates()).map(X509Certificate.class::cast).toArray(X509Certificate[]::new);
+        }
+        if (settings.getAsBoolean(SSLConfigConstants.SECURITY_SSL_HTTP_USE_HEADER_CERT, false)) {
+            return HeaderClientCertResolver.maybeOverride(
+                settings,
+                request,
+                x509Certs,
+                principal,
+                principalExtractor,
+                protocol,
+                cipher,
+                localCerts
+            );
         }
 
         return new SSLInfo(x509Certs, principal, protocol, cipher, localCerts);
